@@ -1,0 +1,7 @@
+name: acompanhamento_turnos
+channels:
+  - snowflake
+dependencies:
+  - streamlit
+  - pandas
+  - snowflake-snowpark-python
