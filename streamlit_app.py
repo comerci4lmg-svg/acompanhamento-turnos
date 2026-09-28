@@ -28,6 +28,9 @@ MESES = [
     "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro",
 ]
 FUSO_GOIAS = ZoneInfo("America/Sao_Paulo")
+META_HORAS_PADRAO = 8.0
+META_HORAS_GOOH = 9.0
+META_HORAS_GOOH_DS = 8.0
 
 
 def normalizar_nome(valor):
@@ -569,6 +572,206 @@ def estilo_refeicao(valor):
     return estilos.get(str(valor), "")
 
 
+def marcar_ds_estimado_gooh(dados):
+    """Marca no máximo um possível DS por semana para cada equipe GOOH.
+
+    A fonte ainda não possui uma coluna de escala/DS. Por isso, a estimativa usa a
+    abertura mais próxima das 09:00, dentro da janela de 08:30 a 10:30. A regra é
+    aplicada sobre todo o histórico carregado para não duplicar um DS na virada do mês.
+    """
+    resultado = pd.Series(False, index=dados.index, dtype=bool)
+    if dados.empty:
+        return resultado
+
+    inicio = pd.to_datetime(dados["INICIO_TURNO"], errors="coerce")
+    minutos_abertura = inicio.dt.hour * 60 + inicio.dt.minute
+    candidatos = dados[
+        dados["GRUPO"].eq("GOOH")
+        & inicio.notna()
+        & minutos_abertura.between(8 * 60 + 30, 10 * 60 + 30)
+    ].copy()
+    if candidatos.empty:
+        return resultado
+
+    inicio_candidatos = pd.to_datetime(candidatos["INICIO_TURNO"], errors="coerce")
+    calendario_iso = inicio_candidatos.dt.isocalendar()
+    candidatos["ANO_ISO"] = calendario_iso.year.astype(int)
+    candidatos["SEMANA_ISO"] = calendario_iso.week.astype(int)
+    candidatos["DISTANCIA_09H"] = (
+        inicio_candidatos.dt.hour * 60 + inicio_candidatos.dt.minute - 9 * 60
+    ).abs()
+    escolhidos = (
+        candidatos.sort_values(["DISTANCIA_09H", "INICIO_TURNO"])
+        .groupby(["PREFIXO", "ANO_ISO", "SEMANA_ISO"], sort=False)
+        .head(1)
+        .index
+    )
+    resultado.loc[escolhidos] = True
+    return resultado
+
+
+def calcular_analise_mensal(dados, ano, mes, grupos, equipes_selecionadas):
+    """Calcula o percentual de jornadas abaixo da meta para cada equipe."""
+    universo = dados[dados["GRUPO"].isin(grupos)].copy()
+    if equipes_selecionadas:
+        universo = universo[universo["PREFIXO"].isin(equipes_selecionadas)]
+    universo = ocultar_desmobilizadas_sem_movimento(universo, ano, mes)
+    universo["DS_ESTIMADO"] = marcar_ds_estimado_gooh(dados).reindex(
+        universo.index, fill_value=False
+    )
+
+    datas = pd.to_datetime(universo["DATA"], errors="coerce")
+    jornadas = universo[
+        datas.dt.year.eq(ano)
+        & datas.dt.month.eq(mes)
+        & universo["FIM_TURNO"].notna()
+        & universo["DURACAO_HORAS"].notna()
+    ].copy()
+    if jornadas.empty:
+        return pd.DataFrame(), jornadas
+
+    jornadas["META_HORAS"] = META_HORAS_PADRAO
+    jornadas.loc[jornadas["GRUPO"].eq("GOOH"), "META_HORAS"] = META_HORAS_GOOH
+    jornadas.loc[
+        jornadas["GRUPO"].eq("GOOH") & jornadas["DS_ESTIMADO"], "META_HORAS"
+    ] = META_HORAS_GOOH_DS
+    jornadas["DEFICIT_HORAS"] = (
+        jornadas["META_HORAS"] - jornadas["DURACAO_HORAS"]
+    ).clip(lower=0)
+    jornadas["COM_DESVIO"] = jornadas["DEFICIT_HORAS"].gt(1 / 60)
+
+    ranking = (
+        jornadas.groupby(["GRUPO", "PREFIXO"], as_index=False)
+        .agg(
+            JORNADAS_ANALISADAS=("PREFIXO", "size"),
+            JORNADAS_COM_DESVIO=("COM_DESVIO", "sum"),
+            MEDIA_HORAS=("DURACAO_HORAS", "mean"),
+            DEFICIT_TOTAL_HORAS=("DEFICIT_HORAS", "sum"),
+            DIAS_DS_ESTIMADOS=("DS_ESTIMADO", "sum"),
+        )
+    )
+    ranking["PERCENTUAL_DESVIO"] = (
+        100 * ranking["JORNADAS_COM_DESVIO"] / ranking["JORNADAS_ANALISADAS"]
+    ).round(1)
+    ranking["MEDIA_HORAS"] = ranking["MEDIA_HORAS"].round(4)
+    ranking["DEFICIT_TOTAL_HORAS"] = ranking["DEFICIT_TOTAL_HORAS"].round(4)
+    ranking = ranking.sort_values(
+        ["GRUPO", "PERCENTUAL_DESVIO", "DEFICIT_TOTAL_HORAS", "PREFIXO"],
+        ascending=[True, False, False, True],
+    ).reset_index(drop=True)
+    return ranking, jornadas
+
+
+def montar_ocorrencias_mensais(jornadas, intervalos_individuais, ano, mes, grupos, equipes):
+    """Monta os destaques do mês com base em regras auditáveis."""
+    ocorrencias = []
+    for _, linha in jornadas[jornadas["COM_DESVIO"]].iterrows():
+        ocorrencias.append({
+            "GRUPO": linha["GRUPO"],
+            "EQUIPE": linha["PREFIXO"],
+            "DATA": linha["DATA"],
+            "OCORRENCIA": "Jornada abaixo da meta",
+            "DETALHE": (
+                f"Realizado {formatar_duracao(linha['DURACAO_HORAS'])}; "
+                f"meta {formatar_duracao(linha['META_HORAS'])}; "
+                f"déficit {formatar_duracao(linha['DEFICIT_HORAS'])}"
+                + (" (DS estimado)" if linha["DS_ESTIMADO"] else "")
+            ),
+            "SEVERIDADE_MIN": round(float(linha["DEFICIT_HORAS"]) * 60),
+        })
+
+    for _, linha in jornadas[jornadas["ABERTURAS_NO_DIA"].gt(1)].iterrows():
+        ocorrencias.append({
+            "GRUPO": linha["GRUPO"],
+            "EQUIPE": linha["PREFIXO"],
+            "DATA": linha["DATA"],
+            "OCORRENCIA": "Múltiplas aberturas no dia",
+            "DETALHE": f"{int(linha['ABERTURAS_NO_DIA'])} aberturas consolidadas em um turno",
+            "SEVERIDADE_MIN": int(linha["ABERTURAS_NO_DIA"]) * 10,
+        })
+
+    if not intervalos_individuais.empty:
+        intervalos = intervalos_individuais.copy()
+        inicio = pd.to_datetime(intervalos["INICIO_INTERVALO"], errors="coerce")
+        motivos = intervalos["MOTIVO_INTERVALO"].fillna("").map(normalizar_nome)
+        intervalos = intervalos[
+            inicio.dt.year.eq(ano)
+            & inicio.dt.month.eq(mes)
+            & intervalos["GRUPO"].isin(grupos)
+            & motivos.eq("REFEICAO")
+        ].copy()
+        if equipes:
+            intervalos = intervalos[intervalos["PREFIXO"].isin(equipes)]
+        if not intervalos.empty:
+            intervalos["DATA_REFEICAO"] = pd.to_datetime(
+                intervalos["INICIO_INTERVALO"]
+            ).dt.date
+            refeicoes = (
+                intervalos.groupby(["GRUPO", "PREFIXO", "DATA_REFEICAO"], as_index=False)
+                ["INTERVALO_HORAS"].sum()
+            )
+            for _, linha in refeicoes[refeicoes["INTERVALO_HORAS"].gt(1.25)].iterrows():
+                excesso = float(linha["INTERVALO_HORAS"]) - 1.25
+                ocorrencias.append({
+                    "GRUPO": linha["GRUPO"],
+                    "EQUIPE": linha["PREFIXO"],
+                    "DATA": linha["DATA_REFEICAO"],
+                    "OCORRENCIA": "Refeição acima de 01:15",
+                    "DETALHE": f"Total no dia: {formatar_duracao(linha['INTERVALO_HORAS'])}",
+                    "SEVERIDADE_MIN": round(excesso * 60),
+                })
+
+    if not ocorrencias:
+        return pd.DataFrame(columns=[
+            "GRUPO", "EQUIPE", "DATA", "OCORRENCIA", "DETALHE", "SEVERIDADE_MIN"
+        ])
+    return pd.DataFrame(ocorrencias).sort_values(
+        ["SEVERIDADE_MIN", "DATA"], ascending=[False, True]
+    ).reset_index(drop=True)
+
+
+def gerar_relatorio_mensal_texto(ranking, jornadas, ocorrencias, ano, mes):
+    total = len(jornadas)
+    desvios = int(jornadas["COM_DESVIO"].sum()) if total else 0
+    taxa = 100 * desvios / total if total else 0
+    linhas = [
+        f"RELATÓRIO MENSAL DE TURNOS — {MESES[mes - 1].upper()} DE {ano}",
+        "",
+        f"Jornadas encerradas analisadas: {total}",
+        f"Jornadas abaixo da meta: {desvios} ({taxa:.1f}%)",
+        (
+            "Critério: menos de 08:00 para GOOL/GOOC/GOOK; menos de 09:00 para "
+            "GOOH; no DS estimado da GOOH, menos de 08:00."
+        ),
+        "",
+        "EQUIPES COM MAIOR PERCENTUAL DE DESVIO POR GRUPO",
+    ]
+    for grupo in GRUPOS:
+        grupo_ranking = ranking[ranking["GRUPO"].eq(grupo)].head(5)
+        if grupo_ranking.empty:
+            continue
+        linhas.append(f"\n{grupo}")
+        for _, item in grupo_ranking.iterrows():
+            linhas.append(
+                f"- {item['PREFIXO']}: {item['PERCENTUAL_DESVIO']:.1f}% "
+                f"({int(item['JORNADAS_COM_DESVIO'])}/{int(item['JORNADAS_ANALISADAS'])} jornadas)"
+            )
+    linhas.extend(["", "PRINCIPAIS OCORRÊNCIAS"])
+    if ocorrencias.empty:
+        linhas.append("- Nenhuma ocorrência encontrada pelos critérios atuais.")
+    else:
+        for _, item in ocorrencias.head(20).iterrows():
+            data_item = pd.to_datetime(item["DATA"]).strftime("%d/%m/%Y")
+            linhas.append(
+                f"- {data_item} | {item['EQUIPE']} | {item['OCORRENCIA']} | {item['DETALHE']}"
+            )
+    linhas.extend([
+        "",
+        "Observação: o DS é estimado porque a fonte atual não possui uma coluna explícita de escala.",
+    ])
+    return "\n".join(linhas)
+
+
 st.title("Acompanhamento de Turnos GO")
 st.caption("Abertura e fechamento reais • dados atualizados pelo bot")
 if st.sidebar.button("Atualizar dados", type="primary", use_container_width=True):
@@ -645,6 +848,13 @@ else:
         "MOTIVO_INTERVALO"
     ].map(normalizar_nome)
 
+ranking_mensal, jornadas_mensais = calcular_analise_mensal(
+    dados, ano, mes, grupos, equipes
+)
+ocorrencias_mensais = montar_ocorrencias_mensais(
+    jornadas_mensais, intervalos_individuais, ano, mes, grupos, equipes
+)
+
 metricas = st.columns(4)
 metricas[0].metric("Turnos consolidados", filtrado["HIST_TURMA_PLANTAO_ID"].nunique())
 metricas[1].metric("Equipes", filtrado["PREFIXO"].nunique())
@@ -659,14 +869,149 @@ colunas = [
     "MOTIVOS_INTERVALO", "PARTICIPA_ESCALA", "OBSERVACAO",
 ]
 (
-    aba_turnos, aba_mapa, aba_horas, aba_intervalos, aba_refeicao,
-    aba_ranking, aba_resumo,
+    aba_analise, aba_ocorrencias, aba_turnos, aba_mapa, aba_horas,
+    aba_intervalos, aba_refeicao, aba_ranking, aba_resumo,
 ) = st.tabs(
     [
-        "Turnos", "Mapa mensal", "Horas trabalhadas", "Intervalos",
-        "Intervalos de refeição", "Ranking de intervalos", "Resumo diário",
+        "Análise mensal", "Ocorrências", "Turnos", "Mapa mensal",
+        "Horas trabalhadas", "Intervalos", "Intervalos de refeição",
+        "Ranking de intervalos", "Resumo diário",
     ]
 )
+with aba_analise:
+    st.subheader(f"Análise mensal — {MESES[mes - 1]} de {ano}")
+    st.caption(
+        "Percentual de desvio = jornadas encerradas abaixo da meta ÷ jornadas "
+        "encerradas analisadas. Metas: 08:00 para GOOL, GOOC e GOOK; 09:00 para "
+        "GOOH; 08:00 no DS estimado da GOOH."
+    )
+    if jornadas_mensais.empty:
+        st.info("Ainda não há jornadas encerradas para analisar neste período.")
+    else:
+        total_jornadas = len(jornadas_mensais)
+        total_desvios = int(jornadas_mensais["COM_DESVIO"].sum())
+        taxa_geral = 100 * total_desvios / total_jornadas
+        deficit_total = float(jornadas_mensais["DEFICIT_HORAS"].sum())
+        indicadores = st.columns(4)
+        indicadores[0].metric("Equipes analisadas", ranking_mensal["PREFIXO"].nunique())
+        indicadores[1].metric("Jornadas encerradas", total_jornadas)
+        indicadores[2].metric(
+            "Jornadas com desvio", f"{total_desvios} ({taxa_geral:.1f}%)"
+        )
+        indicadores[3].metric("Déficit acumulado", formatar_duracao(deficit_total))
+
+        st.markdown("#### Equipes mais ofensoras por prefixo")
+        for grupo in grupos:
+            ranking_grupo = ranking_mensal[
+                ranking_mensal["GRUPO"].eq(grupo)
+            ].copy()
+            if ranking_grupo.empty:
+                continue
+            with st.container(border=True):
+                st.markdown(f"### {grupo}")
+                for _, item in ranking_grupo.head(5).iterrows():
+                    coluna_equipe, coluna_barra, coluna_percentual = st.columns(
+                        [2.2, 6, 1.2], vertical_alignment="center"
+                    )
+                    coluna_equipe.markdown(f"**{item['PREFIXO']}**")
+                    percentual = float(item["PERCENTUAL_DESVIO"])
+                    coluna_barra.progress(
+                        min(100, max(0, round(percentual))),
+                        text=(
+                            f"{int(item['JORNADAS_COM_DESVIO'])} de "
+                            f"{int(item['JORNADAS_ANALISADAS'])} jornadas"
+                        ),
+                    )
+                    coluna_percentual.markdown(f"**{percentual:.1f}%**")
+
+                with st.expander(f"Ver ranking completo de {grupo}"):
+                    exibir = ranking_grupo.copy()
+                    exibir["MÉDIA"] = exibir["MEDIA_HORAS"].map(formatar_duracao)
+                    exibir["DÉFICIT TOTAL"] = exibir["DEFICIT_TOTAL_HORAS"].map(
+                        formatar_duracao
+                    )
+                    exibir["% DESVIO"] = exibir["PERCENTUAL_DESVIO"].map(
+                        lambda valor: f"{valor:.1f}%"
+                    )
+                    st.dataframe(
+                        exibir[[
+                            "PREFIXO", "% DESVIO", "JORNADAS_COM_DESVIO",
+                            "JORNADAS_ANALISADAS", "MÉDIA", "DÉFICIT TOTAL",
+                            "DIAS_DS_ESTIMADOS",
+                        ]],
+                        hide_index=True,
+                        use_container_width=True,
+                        column_config={
+                            "PREFIXO": "Equipe",
+                            "JORNADAS_COM_DESVIO": "Jornadas com desvio",
+                            "JORNADAS_ANALISADAS": "Jornadas analisadas",
+                            "DIAS_DS_ESTIMADOS": "DS estimados",
+                        },
+                    )
+
+        st.info(
+            "DS estimado: no máximo uma abertura GOOH por equipe/semana entre "
+            "08:30 e 10:30, escolhendo a mais próxima das 09:00. Quando a fonte "
+            "passar a informar o DS, esta estimativa poderá ser substituída pelo dado oficial."
+        )
+        relatorio_texto = gerar_relatorio_mensal_texto(
+            ranking_mensal, jornadas_mensais, ocorrencias_mensais, ano, mes
+        )
+        botoes_relatorio = st.columns(2)
+        botoes_relatorio[0].download_button(
+            "Baixar ranking mensal em CSV",
+            ranking_mensal.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
+            file_name=f"ranking_desvios_{ano}_{mes:02}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+        botoes_relatorio[1].download_button(
+            "Baixar relatório mensal em TXT",
+            relatorio_texto.encode("utf-8-sig"),
+            file_name=f"relatorio_turnos_{ano}_{mes:02}.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+with aba_ocorrencias:
+    st.subheader(f"Principais ocorrências — {MESES[mes - 1]} de {ano}")
+    st.caption(
+        "Destaques calculados a partir de jornadas abaixo da meta, múltiplas "
+        "aberturas no mesmo dia e refeições acima de 01:15."
+    )
+    if ocorrencias_mensais.empty:
+        st.success("Nenhuma ocorrência foi encontrada pelos critérios atuais.")
+    else:
+        contagens = (
+            ocorrencias_mensais.groupby("OCORRENCIA").size().sort_values(ascending=False)
+        )
+        colunas_ocorrencias = st.columns(len(contagens))
+        for coluna, (nome, quantidade) in zip(colunas_ocorrencias, contagens.items()):
+            coluna.metric(nome, int(quantidade))
+
+        tabela_ocorrencias = ocorrencias_mensais.copy()
+        st.dataframe(
+            tabela_ocorrencias[
+                ["DATA", "GRUPO", "EQUIPE", "OCORRENCIA", "DETALHE"]
+            ],
+            hide_index=True,
+            use_container_width=True,
+            height=min(720, 70 + len(tabela_ocorrencias) * 35),
+            column_config={
+                "DATA": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
+                "GRUPO": "Grupo",
+                "EQUIPE": "Equipe",
+                "OCORRENCIA": "Ocorrência",
+                "DETALHE": "Detalhe",
+            },
+        )
+        st.download_button(
+            "Baixar ocorrências em CSV",
+            tabela_ocorrencias.to_csv(index=False, sep=";", decimal=",").encode(
+                "utf-8-sig"
+            ),
+            file_name=f"ocorrencias_turnos_{ano}_{mes:02}.csv",
+            mime="text/csv",
+        )
 with aba_turnos:
     st.subheader(f"Turnos de {MESES[mes - 1]} de {ano}")
     st.dataframe(
